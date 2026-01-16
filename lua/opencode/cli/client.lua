@@ -6,7 +6,8 @@ local M = {}
 local sse_state = {
   -- Track the port - `opencode` may have restarted, usually on a new port
   port = nil,
-  job_id = nil,
+  ---@type vim.SystemObj|nil
+  system_object = nil,
 }
 
 ---Generate a UUID v4 (cross-platform, no external dependencies)
@@ -47,41 +48,11 @@ local function generate_uuid()
   )
 end
 
----@param data table
----@param buffer table
----@return table
-local function handle_response(data, buffer)
-  local responses = {}
-  for _, line in ipairs(data) do
-    if line ~= "" then
-      -- Strip "data: " prefix for SSEs
-      local clean_line = (line:gsub("^data: ?", ""))
-      table.insert(buffer, clean_line)
-    elseif #buffer > 0 then
-      -- Blank line = end of event or response; process the accumulated buffer
-      local full_event = table.concat(buffer)
-      -- Reset buffer
-      for k in pairs(buffer) do
-        buffer[k] = nil
-      end
-
-      local ok, response = pcall(vim.fn.json_decode, full_event)
-      if ok then
-        table.insert(responses, response)
-      else
-        vim.notify("Response decode error: " .. full_event, vim.log.levels.ERROR, { title = "opencode" })
-      end
-    end
-  end
-
-  return responses
-end
-
 ---@param url string
 ---@param method string
 ---@param body table|nil
 ---@param callback fun(response: table)|nil
----@return number job_id
+---@return vim.SystemObj
 local function curl(url, method, body, callback)
   local command = {
     "curl",
@@ -104,36 +75,60 @@ local function curl(url, method, body, callback)
 
   -- Buffer the response outside of the job callbacks - they may be called multiple times
   local response_buffer = {}
-  local stderr_lines = {}
-  -- TODO: Migrate to newer `vim.system` API.
-  -- (Maybe synchronously for non-SSE, because we're called from Promises? Simpler.)
-  return vim.fn.jobstart(command, {
-    on_stdout = function(_, data)
-      local responses = handle_response(data, response_buffer)
-      if callback then
-        for _, response in ipairs(responses) do
-          callback(response)
+  local function process_response_buffer()
+    if #response_buffer > 0 then
+      local full_event = table.concat(response_buffer)
+      for k in pairs(response_buffer) do
+        response_buffer[k] = nil
+      end
+      vim.schedule(function()
+        local ok, response = pcall(vim.fn.json_decode, full_event)
+        if ok then
+          if callback then
+            callback(response)
+          end
+        else
+          vim.notify(
+            "Response decode error: " .. full_event .. "; " .. response,
+            vim.log.levels.ERROR,
+            { title = "opencode" }
+          )
+        end
+      end)
+    end
+  end
+
+  return vim.system(command, {
+    text = true,
+    stdout = function(_, data)
+      if not data then
+        return
+      end
+      for _, line in ipairs(vim.split(data, "\n")) do
+        if line == "" then
+          -- Blank line indicates end of SSE event
+          process_response_buffer()
+        else
+          -- Strip "data: " SSE prefix
+          local clean_line = (line:gsub("^data: ?", ""))
+          table.insert(response_buffer, clean_line)
         end
       end
     end,
-    on_stderr = function(_, data)
-      if data then
-        for _, line in ipairs(data) do
-          table.insert(stderr_lines, line)
-        end
-      end
-    end,
-    on_exit = function(_, code)
-      -- 18 means connection closed while there was more data to read, which happens occasionally with SSEs when we quit opencode. nbd.
-      if code ~= 0 and code ~= 18 then
-        local error_message = "curl command failed with exit code: "
-          .. code
-          .. "\nstderr:\n"
-          .. (#stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>")
-        vim.notify(error_message, vim.log.levels.ERROR, { title = "opencode" })
-      end
-    end,
-  })
+  }, function(obj)
+    if obj.code == 0 then
+      -- Process any remaining buffered data.
+      -- Particularly import for non-SSE responses which won't have a trailing blank line.
+      process_response_buffer()
+    elseif obj.code ~= 18 then
+      -- 18 above means connection closed while there was more data to read, which happens occasionally with SSEs when we quit opencode. nbd.
+      local error_message = "curl command failed with exit code: "
+        .. obj.code
+        .. "\nstderr:\n"
+        .. (obj.stderr or "<none>")
+      vim.notify(error_message, vim.log.levels.ERROR, { title = "opencode" })
+    end
+  end)
 end
 
 ---Call an opencode server endpoint.
@@ -142,8 +137,9 @@ end
 ---@param method "GET"|"POST"
 ---@param body table|nil
 ---@param callback fun(response: table)|nil
+---@return vim.SystemObj
 function M.call(port, path, method, body, callback)
-  curl("http://localhost:" .. port .. path, method, body, callback)
+  return curl("http://localhost:" .. port .. path, method, body, callback)
 end
 
 ---@param text string
@@ -254,30 +250,31 @@ end
 ---@field properties table
 
 ---Calls the `/event` SSE endpoint and invokes `callback` for each event received.
+---Stops any previous subscription, so only one is active at a time.
 ---
 ---@param port number
 ---@param callback fun(response: opencode.cli.client.Event)|nil
 function M.sse_subscribe(port, callback)
   if sse_state.port ~= port then
-    if sse_state.job_id then
-      vim.fn.jobstop(sse_state.job_id)
+    if sse_state.system_object then
+      sse_state.system_object:kill(9)
     end
 
     sse_state = {
       port = port,
-      job_id = M.call(port, "/event", "GET", nil, callback),
+      system_object = M.call(port, "/event", "GET", nil, callback),
     }
   end
 end
 
 function M.sse_unsubscribe()
-  if sse_state.job_id then
-    vim.fn.jobstop(sse_state.job_id)
+  if sse_state.system_object then
+    sse_state.system_object:kill(9)
   end
 
   sse_state = {
     port = nil,
-    job_id = nil,
+    system_object = nil,
   }
 end
 
